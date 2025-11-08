@@ -1,5 +1,4 @@
 # factcheck.py
-
 import torch
 from typing import List
 import numpy as np
@@ -7,9 +6,9 @@ import spacy
 import gc
 import re
 
-# -------------------------
-# Lightweight utilities
-# -------------------------
+# =========================
+# Tokenization utilities
+# =========================
 
 STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "if", "while", "with", "of", "at",
@@ -21,12 +20,22 @@ STOPWORDS = {
 }
 
 
-def simple_tokenize(text: str):
+def bow_tokenize(text: str):
     """
-    Very lightweight tokenizer:
+    Tokenizer for the word-overlap model.
     - lowercase
-    - keep alphanumeric word pieces
-    - drop common stopwords
+    - keep alphanumeric tokens
+    - DO NOT remove stopwords
+    """
+    return re.findall(r"\b\w+\b", (text or "").lower())
+
+
+def content_tokenize(text: str):
+    """
+    Tokenizer for lexical pruning in entailment / parsing models.
+    - lowercase
+    - keep alphanumeric tokens
+    - remove simple stopwords
     """
     tokens = re.findall(r"\b\w+\b", (text or "").lower())
     return [t for t in tokens if t not in STOPWORDS]
@@ -55,15 +64,13 @@ def split_sentences(text: str):
     return [s.strip() for s in parts if s.strip()]
 
 
-# -------------------------
-# Core data structure
-# -------------------------
+# =========================
+# Core container
+# =========================
 
 class FactExample:
     """
-    Container for one fact-checking instance.
-
-    fact:     atomic fact text
+    fact:     fact string
     passages: list of {"title": str, "text": str}
     label:    "S", "NS", or "IR"
     """
@@ -76,13 +83,13 @@ class FactExample:
         return f"FactExample(fact={self.fact!r}, label={self.label!r}, passages={self.passages!r})"
 
 
-# -------------------------
+# =========================
 # Entailment model wrapper
-# -------------------------
+# =========================
 
 class EntailmentModel:
     """
-    Thin wrapper around a HuggingFace NLI model.
+    Thin wrapper around HuggingFace NLI model.
 
     Assumes label order: [entailment, neutral, contradiction]
     (true for MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli).
@@ -95,7 +102,7 @@ class EntailmentModel:
 
     def check_entailment(self, premise: str, hypothesis: str):
         """
-        Run the NLI model and return:
+        Run NLI and return:
             {
                 "entailment": p_ent,
                 "neutral": p_neu,
@@ -122,7 +129,6 @@ class EntailmentModel:
             logits = outputs.logits
             probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
 
-        # Avoid memory buildup
         del inputs, outputs, logits
         gc.collect()
 
@@ -133,18 +139,12 @@ class EntailmentModel:
         }
 
 
-# -------------------------
-# Base + baselines
-# -------------------------
+# =========================
+# Base + simple baselines
+# =========================
 
 class FactChecker(object):
-    """
-    Base class for all fact checkers.
-    """
     def predict(self, fact: str, passages: List[dict]) -> str:
-        """
-        Must return "S" or "NS".
-        """
         raise Exception("Use a subclass of FactChecker.")
 
 
@@ -158,36 +158,35 @@ class AlwaysEntailedFactChecker(FactChecker):
         return "S"
 
 
-# -------------------------
-# Part 1: Word overlap
-# -------------------------
+# =========================
+# Part 1: Word Overlap
+# =========================
 
 class WordRecallThresholdFactChecker(FactChecker):
     """
-    Word-overlap baseline.
+    Bag-of-words overlap baseline.
 
-    Strategy:
-    - Tokenize fact and each passage.
-    - Compute recall of fact tokens w.r.t. passage tokens.
-    - Take max recall over passages.
-    - Predict "S" if max_recall >= threshold else "NS".
+    Implementation:
+    - Case-insensitive unigram overlap (no stopword removal).
+    - For each fact, compute recall of its tokens w.r.t. each passage.
+    - Use the maximum recall over passages as score.
+    - Predict "S" if score >= threshold, else "NS".
     """
 
-    def __init__(self, threshold: float = 0.35):
-        # This threshold can be tuned on dev for >=75% accuracy.
+    def __init__(self, threshold: float = 0.32):
         self.threshold = threshold
 
     def predict(self, fact: str, passages: List[dict]) -> str:
-        fact_tokens = simple_tokenize(fact)
+        fact_tokens = bow_tokenize(fact)
         if not fact_tokens or not passages:
             return "NS"
 
         best_recall = 0.0
         for p in passages:
-            text = p.get("text", "")
+            text = p.get("text", "") or ""
             if not text:
                 continue
-            ctx_tokens = simple_tokenize(text)
+            ctx_tokens = bow_tokenize(text)
             if not ctx_tokens:
                 continue
             r = recall_overlap(fact_tokens, ctx_tokens)
@@ -197,30 +196,27 @@ class WordRecallThresholdFactChecker(FactChecker):
         return "S" if best_recall >= self.threshold else "NS"
 
 
-# -------------------------
-# Part 2: Entailment
-# -------------------------
+# =========================
+# Part 2: Entailment-based
+# =========================
 
 class EntailmentFactChecker(FactChecker):
     """
     Entailment-based fact checker with lexical pruning.
 
     Steps:
-    1. Coarse prune passages by low word overlap.
-    2. Split remaining passages into sentences.
-    3. Coarse prune sentences by low overlap.
-    4. Run NLI on (premise = sentence, hypothesis = fact).
-    5. Take max entailment probability.
-    6. Predict "S" if:
-         best_ent >= entailment_threshold
-         AND best_ent >= contradiction probability.
+      1. Coarse prune passages using content-word recall.
+      2. Split remaining passages into sentences.
+      3. Coarse prune sentences using content-word recall.
+      4. Run NLI on (premise = sentence, hypothesis = fact).
+      5. Use max entailment probability for decision.
     """
 
     def __init__(
         self,
         ent_model: EntailmentModel,
-        overlap_prune_threshold: float = 0.08,
-        sent_overlap_threshold: float = 0.10,
+        overlap_prune_threshold: float = 0.05,
+        sent_overlap_threshold: float = 0.08,
         entailment_threshold: float = 0.60,
     ):
         self.ent_model = ent_model
@@ -233,7 +229,7 @@ class EntailmentFactChecker(FactChecker):
         if not fact or not passages:
             return "NS"
 
-        fact_tokens = simple_tokenize(fact)
+        fact_tokens = content_tokenize(fact)
         if not fact_tokens:
             return "NS"
 
@@ -241,22 +237,22 @@ class EntailmentFactChecker(FactChecker):
         best_margin = -1.0
 
         for p in passages:
-            text = p.get("text", "")
+            text = p.get("text", "") or ""
             if not text:
                 continue
 
             # Passage-level pruning
-            ptoks = simple_tokenize(text)
+            ptoks = content_tokenize(text)
             if ptoks:
                 passage_recall = recall_overlap(fact_tokens, ptoks)
                 if passage_recall < self.overlap_prune_threshold:
                     continue
 
-            # Sentence-level
+            # Sentence-level pruning + NLI
             for sent in split_sentences(text):
                 if not sent:
                     continue
-                stoks = simple_tokenize(sent)
+                stoks = content_tokenize(sent)
                 if not stoks:
                     continue
 
@@ -279,21 +275,21 @@ class EntailmentFactChecker(FactChecker):
             return "NS"
 
 
-# -------------------------
+# =========================
 # Optional: Dependency-based
-# -------------------------
+# =========================
 
 class DependencyRecallThresholdFactChecker(FactChecker):
     """
-    Optional: dependency-based overlap checker.
+    Optional syntactic-overlap model.
 
-    Uses dependency triples (head, dep, child).
-    Robust to missing spaCy model:
-      - tries 'en_core_web_sm'
-      - falls back to blank('en') (then returns empty deps).
+    Uses dependency triples (head, dep, child) and computes
+    recall of fact's triples within passage triples.
+
+    Robust to missing spaCy model: falls back to blank English.
     """
 
-    def __init__(self, threshold: float = 0.3):
+    def __init__(self, threshold: float = 0.30):
         try:
             self.nlp = spacy.load("en_core_web_sm")
         except Exception:
@@ -311,7 +307,7 @@ class DependencyRecallThresholdFactChecker(FactChecker):
 
         best_recall = 0.0
         for p in passages:
-            text = p.get("text", "")
+            text = p.get("text", "") or ""
             if not text:
                 continue
             ctx_rels = self.get_dependencies(text)
@@ -325,10 +321,6 @@ class DependencyRecallThresholdFactChecker(FactChecker):
         return "S" if best_recall >= self.threshold else "NS"
 
     def get_dependencies(self, sent: str):
-        """
-        Extract (head, dep, child) relations, filtering out
-        uninformative dependency labels.
-        """
         sent = (sent or "").strip()
         if not sent:
             return set()
@@ -351,4 +343,3 @@ class DependencyRecallThresholdFactChecker(FactChecker):
             relations.add((head, token.dep_, child))
 
         return relations
-
