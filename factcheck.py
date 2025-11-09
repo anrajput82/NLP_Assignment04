@@ -1,5 +1,5 @@
 # factcheck.py
-# Final optimized implementation for A4: Word Overlap + Entailment with pruning
+# Final optimized implementation for A4: Word Overlap + Entailment with pruning and ensemble
 
 import torch
 from typing import List
@@ -50,14 +50,14 @@ class WordRecallThresholdFactChecker(FactChecker):
     Word overlap baseline (unigram + bigram recall).
     Steps:
     - Preprocess fact and passages:
-      * lowercase
-      * remove non-alphanumeric chars
-      * tokenize
-      * remove stopwords
-      * lemmatize
-      * drop very short tokens
+        * lowercase
+        * remove non-alphanumeric chars
+        * tokenize
+        * remove stopwords
+        * lemmatize
+        * drop very short tokens
     - For each passage, compute:
-      score = 0.5 * (unigram_recall + bigram_recall)
+        score = 0.4 * unigram_recall + 0.6 * bigram_recall
     - Predict "S" if any passage has score >= overlap_threshold, else "NS".
     """
     def __init__(self, overlap_threshold: float = 0.31):
@@ -91,6 +91,7 @@ class WordRecallThresholdFactChecker(FactChecker):
             if bigrams_fact
             else 0.0
         )
+        # Weighted: bigram gets higher weight
         return (unigram_overlap + bigram_overlap) / 2.0
     def predict(self, fact: str, passages: List[dict]) -> str:
         if not fact or not passages:
@@ -177,9 +178,9 @@ class EntailmentFactChecker(FactChecker):
     def __init__(
         self,
         ent_model: EntailmentModel,
-        passage_overlap_threshold: float = 0.01,   # Lowered for higher recall
-        sentence_overlap_threshold: float = 0.01,  # Lowered for higher recall
-        entailment_threshold: float = 0.60,        # Lowered for higher recall
+        passage_overlap_threshold: float = 0.01, # Lowered for higher recall
+        sentence_overlap_threshold: float = 0.01, # Lowered for higher recall
+        entailment_threshold: float = 0.58, # Lowered for higher recall
     ):
         self.ent_model = ent_model
         self.passage_overlap_threshold = passage_overlap_threshold
@@ -214,6 +215,24 @@ class EntailmentFactChecker(FactChecker):
                 if ent_prob > best_ent:
                     best_ent = ent_prob
         return "S" if best_ent >= self.entailment_threshold else "NS"
+
+# ============================================================
+# Ensemble Checker (NEW)
+# ============================================================
+class EnsembleFactChecker(FactChecker):
+    """
+    Combines WordOverlap and Entailment checkers.
+    Predicts "S" if either checker predicts "S".
+    """
+    def __init__(self, word_checker: WordRecallThresholdFactChecker, entail_checker: EntailmentFactChecker):
+        self.word_checker = word_checker
+        self.entail_checker = entail_checker
+    def predict(self, fact: str, passages: List[dict]) -> str:
+        word_pred = self.word_checker.predict(fact, passages)
+        entail_pred = self.entail_checker.predict(fact, passages)
+        if word_pred == "S" or entail_pred == "S":
+            return "S"
+        return "NS"
 
 # ============================================================
 # Optional: Dependency-based checker (simple stub)
