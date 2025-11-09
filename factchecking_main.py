@@ -14,6 +14,7 @@ def _parse_args():
     # parser.add_argument('--labels_path', type=str, default="data/labeled_ChatGPT.jsonl", help="path to the labels")
     parser.add_argument('--labels_path', type=str, default="data/dev_labeled_ChatGPT.jsonl", help="path to the labels")
     parser.add_argument('--passages_path', type=str, default="data/passages_bm25_ChatGPT_humfacts.jsonl", help="path to the passages retrieved for the ChatGPT human-labeled facts")
+    parser.add_argument('--cuda', dest='cuda', default=False, action='store_true', help='skip printing output on the test set')
     args = parser.parse_args()
     return args
 
@@ -144,7 +145,9 @@ if __name__=="__main__":
         # model_name = "roberta-large-mnli"   # alternative model that you can try out if you want
         ent_tokenizer = AutoTokenizer.from_pretrained(model_name)
         roberta_ent_model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        ent_model = EntailmentModel(roberta_ent_model, ent_tokenizer)
+        if args.cuda:
+            roberta_ent_model.to('cuda')
+        ent_model = EntailmentModel(roberta_ent_model, ent_tokenizer, args.cuda)
         fact_checker = EntailmentFactChecker(ent_model)
     else:
         raise NotImplementedError
